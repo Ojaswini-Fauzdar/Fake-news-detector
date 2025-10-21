@@ -1,0 +1,10 @@
+#  ML Libraries
+numpy
+pandas
+scikit-learn
+tensorflow
+nltk
+matplotlib
+seaborn
+streamlit
+ipykernel
