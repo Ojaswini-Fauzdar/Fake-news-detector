@@ -1,1 +1,10 @@
-
+numpy
+pandas
+scikit-learn
+nltk
+streamlit
+python-dotenv
+requests
+PyMuPDF
+joblib
+wikipedia
