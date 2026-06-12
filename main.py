@@ -13,8 +13,13 @@ from langchain_community.utilities import GoogleSerperAPIWrapper
 from langchain_community.document_loaders import PyPDFLoader, WebBaseLoader
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 
-from dotenv import load_dotenv
-load_dotenv()
+import streamlit as st
+try:
+    GOOGLE_API_KEY = st.secrets["GOOGLE_API_KEY"]
+    SERPER_API_KEY = st.secrets.get("SERPER_API_KEY") 
+except Exception:
+    GOOGLE_API_KEY = os.getenv("GOOGLE_API_KEY")
+    SERPER_API_KEY = os.getenv("SERPER_API_KEY")
 
 
 llm = ChatGoogleGenerativeAI(
