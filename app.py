@@ -1,235 +1,213 @@
-import streamlit as st
-import joblib
-import requests
-import pandas as pd
-import re
-import nltk
-from nltk.corpus import stopwords
-import fitz
-import io
-import wikipedia
-from datetime import datetime, timedelta
 import os
-from dotenv import load_dotenv
-import numpy as np
+import tempfile
+from typing import List
+from pydantic import BaseModel, Field
 
+import requests
+from bs4 import BeautifulSoup
+
+from langchain_google_genai import ChatGoogleGenerativeAI
+from langchain_core.prompts import ChatPromptTemplate
+from langchain_core.output_parsers import PydanticOutputParser
+from langchain_community.utilities import GoogleSerperAPIWrapper
+from langchain_community.document_loaders import PyPDFLoader, WebBaseLoader
+from langchain_text_splitters import RecursiveCharacterTextSplitter
+
+from dotenv import load_dotenv
 load_dotenv()
 
-NEWS_API = os.getenv("NEWS_API_KEY") or "your_news_api_key_here"
-FACT_API = os.getenv("FACT_CHECK_API_KEY") or "your_google_api_key_here"
 
-model = joblib.load('svm_model.pkl')
-vectorizer = joblib.load('vectorizer.pkl')
+llm = ChatGoogleGenerativeAI(
+    model="gemini-3.5-flash",          
+    temperature=0.1,
+    max_tokens=2048
+)
 
-nltk.download('stopwords', quiet=True)
-nltk.download('punkt', quiet=True)
-stop = set(stopwords.words('english'))
 
-trusted = ["bbc", "reuters", "ap", "pbs", "npr", "nytimes", "wsj", "washingtonpost",
-           "abc", "cbs", "nbc", "aljazeera", "economist", "guardian", "afp"]
+class Claims(BaseModel):
+    main_claims: List[str] = Field(..., description="List of 3-6 most important verifiable claims")
 
-def clean(text):
-    text = re.sub(r'\W', ' ', str(text)).lower()
-    text = re.sub(r'\s+', ' ', text).strip()
-    return ' '.join(w for w in text.split() if w not in stop)
+class Verdict(BaseModel):
+    verdict: str = Field(..., description="REAL, FAKE, or SUSPICIOUS")
+    confidence: float = Field(..., ge=0, le=1)
+    explanation: str = Field(..., description="Detailed reasoning with key evidence")
+    supporting_sources: List[str] = Field(default_factory=list)
 
-def predict(text):
-    if not text.strip():
-        return "Unknown", 0.0
-    vec = vectorizer.transform([clean(text)])
-    pred = model.predict(vec)[0]
-    score = abs(model.decision_function(vec)[0])
-    prob = 1 / (1 + np.exp(-score))
-    pct = round(prob * 100, 1)
-    return "Fake" if pred == 1 else "Real", pct
+claim_parser = PydanticOutputParser(pydantic_object=Claims)
+verdict_parser = PydanticOutputParser(pydantic_object=Verdict)
 
-@st.cache_data(ttl=3600)
-def get_context(q):
-    date = (datetime.utcnow() - timedelta(days=7)).strftime('%Y-%m-%d')
-    params = {'q': q[:150], 'language': 'en', 'sortBy': 'relevancy',
-              'from': date, 'pageSize': 10, 'apiKey': NEWS_API}
+
+claim_prompt = ChatPromptTemplate.from_messages([
+    ("system", """You are an expert fact extraction assistant.
+Extract only the most important, verifiable factual claims.
+- For short text: return the main claim.
+- For long articles: extract 3-6 key claims.
+Be precise and concise."""),
+    ("human", "Text:\n{text}\n\n{format_instructions}")
+])
+
+verdict_prompt = ChatPromptTemplate.from_messages([
+    ("system", """You are a professional, unbiased fact-checker.
+Use the provided context to evaluate the claims.
+Be strict but fair. Always justify your verdict with specific evidence from the context."""),
+    ("human", """Original Text:
+{text}
+
+Search Context:
+{context}
+
+{format_instructions}""")
+])
+
+
+def clean_text(text: str) -> str:
+    """Clean and normalize extracted text."""
+    lines = (line.strip() for line in text.splitlines())
+    return '\n'.join(chunk for chunk in (phrase.strip() for line in lines for phrase in line.split("  ")) if chunk)
+
+def text_url(url: str) -> str | None:
     try:
-        r = requests.get("https://newsapi.org/v2/everything", params=params, timeout=10)
-        articles = r.json().get('articles', [])[:6]
-        return pd.DataFrame([{
-            'Title': a.get('title', 'N/A'),
-            'Source': a['source'].get('name', 'Unknown'),
-            'Description': (a.get('description') or '')[:200],
-            'Published': a.get('publishedAt', 'N/A')[:10],
-            'URL': a.get('url', '#')
-        } for a in articles])
-    except:
-        return pd.DataFrame()
+        headers = {
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
+        }
+        r = requests.get(url, headers=headers, timeout=12)
+        r.raise_for_status()
 
-@st.cache_data(ttl=86400)
-def check_claim(claim):
+        soup = BeautifulSoup(r.text, 'html.parser')
+        
+        
+        for tag in soup(["script", "style", "nav", "header", "footer", "aside", "button", "form", "comments"]):
+            tag.decompose()
+
+        
+        article = (soup.find('article') or 
+                  soup.find('div', class_=lambda x: x and any(c in x.lower() for c in ['article', 'story', 'content', 'post'])))
+        
+        text = article.get_text(separator="\n") if article else soup.get_text(separator="\n")
+        cleaned = clean_text(text)
+
+        
+        if len(cleaned) < 400:
+            try:
+                loader = WebBaseLoader(url)
+                docs = loader.load()
+                cleaned = docs[0].page_content if docs else cleaned
+            except:
+                pass
+
+        return cleaned.strip()
+
+    except Exception as e:
+        print(f"URL Error {url}: {e}")
+        return None
+
+
+def text_pdf(file) -> str:
+    with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as tmp:
+        tmp.write(file.getvalue())
+        path = tmp.name
+    
     try:
-        url = f"https://factchecktools.googleapis.com/v1alpha1/claims:search?query={claim}&key={FACT_API}"
-        r = requests.get(url, timeout=10)
-        claims = r.json().get('claims', [])
-        if claims:
-            review = claims[0]['claimReview'][0]
-            return review['textualRating'], review['publisher']['name'], review['url']
-        return "No fact checks", None, None
-    except:
-        return "Error", None, None
+        loader = PyPDFLoader(path)
+        pages = loader.load()
+        return "\n\n".join(page.page_content for page in pages)
+    finally:
+        os.unlink(path)
 
-def check_wiki(claim):
+
+def get_claims(text: str) -> List[str]:
+    if not text or len(text.strip()) < 50:
+        return [text.strip()] if text else []
+
     try:
-        wikipedia.set_lang("en")
-        results = wikipedia.search(claim, results=3)
-        if not results:
-            return None, None
-        title = results[0]
-        summary = wikipedia.summary(title, sentences=4)
-        return summary, title
-    except:
-        return None, None
+        chain = claim_prompt | llm | claim_parser
+        response = chain.invoke({
+            "text": text[:14000],  
+            "format_instructions": claim_parser.get_format_instructions()
+        })
+        claims = response.main_claims
+        
+        
+        if not claims:
+            return [text[:600]]
+        
+        return claims[:6]  
+        
+    except Exception as e:
+        print("Claim extraction failed:", e)
+        return [text[:700]]
 
-def get_claims(text):
-    sents = nltk.sent_tokenize(text)
-    claims = [s.strip() for s in sents if len(s.split()) > 10 and not s.lower().startswith(('i ','we ','you '))]
-    return claims[:3] or [text[:300].strip()]
 
-def read_pdf(src):
+import concurrent.futures
+import threading
+
+def fetch_single_url(url: str, text_splitter) -> list:
+    """Fetch a single URL with timeout - designed for parallel execution."""
     try:
-        if isinstance(src, str):
-            r = requests.get(src, timeout=15)
-            stream = io.BytesIO(r.content)
-        else:
-            stream = src
-        doc = fitz.open(stream=stream)
-        txt = "".join(page.get_text("text") + "\n\n" for page in doc)
-        doc.close()
-        return txt.strip(), "PDF"
+        loader = WebBaseLoader(url)
+        loader.requests_kwargs = {"timeout": 6}
+        loaded_docs = loader.load()
+        split_docs = text_splitter.split_documents(loaded_docs)
+        return split_docs[:2]
     except:
-        return "", "PDF failed"
+        return []
 
-def read_file(f):
-    if f.type == "application/pdf":
-        return read_pdf(f)
-    elif "text" in f.type:
+def search_claims(claims: List[str], k_per_claim=2): 
+    serper = GoogleSerperAPIWrapper(k=5)  
+    text_splitter = RecursiveCharacterTextSplitter(chunk_size=1200, chunk_overlap=100)
+    
+    
+    all_urls = []
+    for claim in claims[:3]:  
         try:
-            return f.read().decode("utf-8", errors="ignore"), f.name
-        except:
-            return "", "Read failed"
-    return "", "Unsupported"
+            results = serper.results(claim)
+            for item in results.get("organic", [])[:k_per_claim]:
+                all_urls.append(item['link'])
+        except Exception as e:
+            print(f"Search error: {e}")
+            continue
 
-st.set_page_config(page_title="Fact Check", layout="centered")
+    
+    docs = []
+    with concurrent.futures.ThreadPoolExecutor(max_workers=6) as executor:
+        futures = {executor.submit(fetch_single_url, url, text_splitter): url for url in all_urls}
+        for future in concurrent.futures.as_completed(futures, timeout=15):
+            try:
+                docs.extend(future.result())
+            except:
+                continue
 
-st.title("Fact Checker")
-st.caption("Paste text or upload file to check credibility")
+    return docs[:12]  
 
-mode = st.radio("Input", ["Paste Text", "Upload File"], horizontal=True)
 
-text = ""
-title = ""
-
-if mode == "Paste Text":
-    text = st.text_area("Paste here", height=240, placeholder="Paste content or claim...")
-
-elif mode == "Upload File":
-    up = st.file_uploader("PDF or TXT", type=["pdf", "txt", "text"])
-    if up:
-        with st.spinner("Reading..."):
-            text, title = read_file(up)
-            st.caption(f"**File:** {title}")
-            st.text_area("Preview", text[:700] + "..." if len(text) > 700 else text, height=140, disabled=True)
-
-st.markdown("---")
-
-if text.strip():
-    st.success("Ready to check")
-else:
-    st.info("Add content above")
-
-disabled = not bool(text.strip())
-
-if st.button("Check", type="primary", use_container_width=True, disabled=disabled):
-    with st.spinner("Checking..."):
-        if len(clean(text).split()) < 40:
-            st.warning("Short text — result may be less accurate")
-
-        claims = get_claims(text)
-        main_claim = claims[0] if claims else ""
-
+def get_verdict(text: str, docs):
+    try:
         
-        wiki_summary, wiki_title = check_wiki(main_claim)
+        context_parts = []
+        for doc in docs[:6]:  
+            content = doc.page_content[:1000]  
+            if len(content.strip()) > 100:
+                context_parts.append(content)
 
-        label, conf = predict(text)
-        rating, pub, link = check_claim(main_claim)
-        ctx = get_context(main_claim if not title else f"{title} {main_claim}")
+        context = "\n\n---\n\n".join(context_parts) if context_parts else "No relevant web context found."
 
-        verdict = None
-        score = None
-        by = None
+        chain = verdict_prompt | llm | verdict_parser
+        result = chain.invoke({
+            "text": text[:6000],   
+            "context": context[:8000],  
+            "format_instructions": verdict_parser.get_format_instructions()
+        })
 
-        
-        if wiki_summary and any(kw in main_claim.lower() for kw in ["largest", "biggest", "capital", "population", "longest", "highest", "smallest"]):
-            verdict = "REAL"
-            score = 95
-            by = f"Wikipedia: {wiki_title or 'matched page'}"
+        if not result.supporting_sources and docs:
+            result.supporting_sources = [doc.metadata.get('source', 'Unknown') for doc in docs[:5]]
 
-        
-        elif rating not in ["No fact checks", "Error"]:
-            r = rating.lower()
-            if any(w in r for w in ["true", "correct", "accurate", "mostly true"]):
-                verdict = "REAL"
-                score = 90
-                by = f"Fact check: {rating}"
-            elif any(w in r for w in ["false", "incorrect", "wrong", "pants on fire", "misleading", "mostly false"]):
-                
-                if any(word in main_claim.lower() for word in ["won", "victory", "president", "elected", "largest"]):
-                    verdict = "REAL"
-                    score = 92
-                    by = f"Fact check (inverted): {rating}"
-                else:
-                    verdict = "FAKE"
-                    score = 88
-                    by = f"Fact check: {rating}"
-            else:
-                verdict = "UNCERTAIN"
-                score = 65
-                by = f"Fact check: {rating}"
+        return result
 
-        
-        else:
-            trusted_count = sum(any(s in row['Source'].lower() for s in trusted) for _, row in ctx.iterrows())
-            s = (1 if label == "Real" else -1) * conf + trusted_count * 0.5
-            verdict = "REAL" if s > 0 else "FAKE"
-            score = min(95, max(45, conf + trusted_count * 8))
-            by = f"Model + {trusted_count} trusted"
-
-        st.markdown("### Verdict")
-        color = "#2e7d32" if verdict == "REAL" else "#d32f2f" if verdict == "FAKE" else "#f57c00"
-        st.markdown(f"<h1 style='color:{color}; text-align:center;'>{verdict}</h1>", unsafe_allow_html=True)
-        st.markdown(f"**Confidence: {int(score)}%**")
-        st.progress(int(score) / 100)
-        st.caption(f"Based on: {by}")
-
-        with st.expander("Details"):
-            col1, col2 = st.columns(2)
-            col1.subheader("Model")
-            col1.write(f"{label}  (~{conf:.0f}%)")
-            col2.subheader("Fact check")
-            col2.write(rating)
-            if pub and link:
-                col2.markdown(f"[Source: {pub}]({link})")
-
-        if wiki_summary:
-            with st.expander("Wikipedia"):
-                st.write(wiki_summary)
-                if wiki_title:
-                    st.caption(f"Page: {wiki_title}")
-                    st.markdown(f"[Read on Wikipedia](https://en.wikipedia.org/wiki/{wiki_title.replace(' ', '_')})")
-
-        if claims:
-            st.subheader("Detected claims")
-            for c in claims:
-                st.markdown(f"• {c}")
-
-        if not ctx.empty:
-            st.subheader("Related articles")
-            st.dataframe(ctx[['Title', 'Source', 'Published', 'URL']], use_container_width=True, hide_index=True)
-        else:
-            st.info("No recent related articles found")
+    except Exception as e:
+        print("Verdict Error:", str(e))
+        return Verdict(
+            verdict="SUSPICIOUS",
+            confidence=0.45,
+            explanation=f"Analysis error: {str(e)[:200]}",
+            supporting_sources=[]
+        )
