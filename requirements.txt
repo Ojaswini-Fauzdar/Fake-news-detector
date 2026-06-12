@@ -1,6 +1,6 @@
 langchain
 langchain-core
-langchain-google-genative-ai
+langchain-google-genai
 google-generativeai
 beautifulsoup4
 python-dotenv
