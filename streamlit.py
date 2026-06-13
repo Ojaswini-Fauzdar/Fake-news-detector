@@ -1,13 +1,11 @@
 import streamlit as st
 from main import text_url, text_pdf, get_claims, search_claims, get_verdict
 
-
 st.set_page_config(page_title="Fake News Detector", layout="centered")
-try:
-    GOOGLE_API_KEY = st.secrets["GOOGLE_API_KEY"]
-except Exception:
-    st.error("Missing API key.")
-    st.stop()
+from dotenv import load_dotenv
+
+load_dotenv(override=True)
+
 st.markdown("""
     <style>
         .block-container { padding-top: 3rem; padding-bottom: 3rem; max-width: 780px; }
