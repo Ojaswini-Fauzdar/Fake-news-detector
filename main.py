@@ -5,7 +5,7 @@ from pydantic import BaseModel, Field
 
 import requests
 from bs4 import BeautifulSoup
-
+import concurrent.futures
 from langchain_google_genai import ChatGoogleGenerativeAI
 from langchain_core.prompts import ChatPromptTemplate
 from langchain_core.output_parsers import PydanticOutputParser
@@ -13,19 +13,13 @@ from langchain_community.utilities import GoogleSerperAPIWrapper
 from langchain_community.document_loaders import PyPDFLoader, WebBaseLoader
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 
-import streamlit as st
-try:
-    GOOGLE_API_KEY = st.secrets["GOOGLE_API_KEY"]
-    SERPER_API_KEY = st.secrets.get("SERPER_API_KEY") 
-except Exception:
-    GOOGLE_API_KEY = os.getenv("GOOGLE_API_KEY")
-    SERPER_API_KEY = os.getenv("SERPER_API_KEY")
-
+from dotenv import load_dotenv
+load_dotenv()
 
 llm = ChatGoogleGenerativeAI(
-    model="gemini-3.5-flash",          
+    model="gemini-2.5-flash",          
     temperature=0.1,
-    max_output_tokens=2048
+    max_tokens=2048
 )
 
 
@@ -66,9 +60,17 @@ Search Context:
 
 
 def clean_text(text: str) -> str:
-    """Clean and normalize extracted text."""
-    lines = (line.strip() for line in text.splitlines())
-    return '\n'.join(chunk for chunk in (phrase.strip() for line in lines for phrase in line.split("  ")) if chunk)
+    for line in text.splitlines():
+        lines = (line.strip() )
+    result = []
+    for line in lines:
+        for phrase in line.split("  "):
+            chunk = phrase.strip()
+            if chunk:
+                result.append(chunk)
+    
+    return '\n'.join(result)
+    
 
 def text_url(url: str) -> str | None:
     try:
@@ -85,10 +87,23 @@ def text_url(url: str) -> str | None:
             tag.decompose()
 
         
-        article = (soup.find('article') or 
-                  soup.find('div', class_=lambda x: x and any(c in x.lower() for c in ['article', 'story', 'content', 'post'])))
         
-        text = article.get_text(separator="\n") if article else soup.get_text(separator="\n")
+        article = (
+        soup.find('article') or
+        soup.find(
+           'div',
+            class_=lambda x: x and (
+               'article' in x.lower() or
+               'story' in x.lower() or
+               'content' in x.lower() or
+               'post' in x.lower()
+        )
+    )
+)
+        if article:
+            text = article.get_text(separator="\n") 
+        else:
+            text = soup.get_text(separator="\n")
         cleaned = clean_text(text)
 
         
@@ -122,7 +137,10 @@ def text_pdf(file) -> str:
 
 def get_claims(text: str) -> List[str]:
     if not text or len(text.strip()) < 50:
-        return [text.strip()] if text else []
+        if text:
+            return [text.strip()] 
+        else:
+            return []
 
     try:
         chain = claim_prompt | llm | claim_parser
@@ -143,11 +161,11 @@ def get_claims(text: str) -> List[str]:
         return [text[:700]]
 
 
-import concurrent.futures
-import threading
+
+
 
 def fetch_single_url(url: str, text_splitter) -> list:
-    """Fetch a single URL with timeout - designed for parallel execution."""
+    
     try:
         loader = WebBaseLoader(url)
         loader.requests_kwargs = {"timeout": 6}
@@ -175,7 +193,8 @@ def search_claims(claims: List[str], k_per_claim=2):
     
     docs = []
     with concurrent.futures.ThreadPoolExecutor(max_workers=6) as executor:
-        futures = {executor.submit(fetch_single_url, url, text_splitter): url for url in all_urls}
+        for url in all_urls:
+            futures = {executor.submit(fetch_single_url, url, text_splitter): url }
         for future in concurrent.futures.as_completed(futures, timeout=15):
             try:
                 docs.extend(future.result())
@@ -193,8 +212,10 @@ def get_verdict(text: str, docs):
             content = doc.page_content[:1000]  
             if len(content.strip()) > 100:
                 context_parts.append(content)
-
-        context = "\n\n---\n\n".join(context_parts) if context_parts else "No relevant web context found."
+        if context_parts:
+            context = "\n\n---\n\n".join(context_parts)  
+        else:
+            context = "No relevant web context found."
 
         chain = verdict_prompt | llm | verdict_parser
         result = chain.invoke({
@@ -204,7 +225,8 @@ def get_verdict(text: str, docs):
         })
 
         if not result.supporting_sources and docs:
-            result.supporting_sources = [doc.metadata.get('source', 'Unknown') for doc in docs[:5]]
+            for doc in docs[:5]:
+                result.supporting_sources = [doc.metadata.get('source', 'Unknown') ]
 
         return result
 
